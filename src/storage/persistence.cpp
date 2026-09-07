@@ -1,5 +1,6 @@
 #include "storage/persistence.hpp"
 #include <filesystem>
+#include <utility>
 namespace storage {
 Persistence::Persistence(std::string d):dir_(std::move(d)),wal_(dir_+"/wal.log"),snap_(dir_+"/snapshot.txt"){}
 bool Persistence::open(){std::filesystem::create_directories(dir_);out_.open(wal_,std::ios::app);return out_.good();}
