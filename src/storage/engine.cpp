@@ -1,2 +1,27 @@
 #include "storage/engine.hpp"
-namespace storage {}
+#include <algorithm>
+namespace storage {
+StorageEngine::StorageEngine(std::size_t m):max_memory_(m){}
+std::size_t StorageEngine::value_bytes(const Value&v){if(auto*s=std::get_if<StringValue>(&v))return s->value.size();auto*z=std::get_if<SortedSetValue>(&v);std::size_t n=0;for(auto&[p,x]:z->entries)n+=p.second.size()+sizeof(x);return n;}
+bool StorageEngine::expired(const Node&n)const{return n.entry.expires_at&&std::chrono::steady_clock::now()>=*n.entry.expires_at;}
+void StorageEngine::touch(Node&n){auto k=*n.lru_it;lru_.erase(n.lru_it);lru_.push_front(k);n.lru_it=lru_.begin();}
+void StorageEngine::erase_unlocked(const std::string&k){auto i=table_.find(k);if(i==table_.end())return;memory_used_-=i->second.entry.bytes;lru_.erase(i->second.lru_it);table_.erase(i);}
+StorageEngine::Node*StorageEngine::find_unlocked(const std::string&k){auto i=table_.find(k);if(i==table_.end())return nullptr;if(expired(i->second)){erase_unlocked(k);return nullptr;}return &i->second;}
+void StorageEngine::evict_if_needed(){while(memory_used_>max_memory_&&!lru_.empty())erase_unlocked(lru_.back());}
+bool StorageEngine::set(const std::string&k,const std::string&v,std::optional<std::chrono::milliseconds>ttl){std::lock_guard<std::mutex>g(mu_);erase_unlocked(k);Node n;n.entry.value=StringValue{v};n.entry.bytes=k.size()+v.size();if(ttl)n.entry.expires_at=std::chrono::steady_clock::now()+*ttl;lru_.push_front(k);n.lru_it=lru_.begin();memory_used_+=n.entry.bytes;table_.emplace(k,std::move(n));evict_if_needed();return table_.count(k);}
+std::optional<std::string>StorageEngine::get(const std::string&k){std::lock_guard<std::mutex>g(mu_);auto*n=find_unlocked(k);if(!n)return{};touch(*n);if(auto*s=std::get_if<StringValue>(&n->entry.value))return s->value;return{};}
+bool StorageEngine::del(const std::string&k){std::lock_guard<std::mutex>g(mu_);if(!find_unlocked(k))return false;erase_unlocked(k);return true;}
+std::vector<std::string>StorageEngine::keys(){std::lock_guard<std::mutex>g(mu_);std::vector<std::string>r;for(auto i=table_.begin();i!=table_.end();){auto k=i->first;++i;if(find_unlocked(k))r.push_back(k);}std::sort(r.begin(),r.end());return r;}
+bool StorageEngine::expire(const std::string&k,std::chrono::milliseconds t){std::lock_guard<std::mutex>g(mu_);auto*n=find_unlocked(k);if(!n)return false;n->entry.expires_at=std::chrono::steady_clock::now()+t;return true;}
+long long StorageEngine::pttl(const std::string&k){std::lock_guard<std::mutex>g(mu_);auto*n=find_unlocked(k);if(!n)return-2;if(!n->entry.expires_at)return-1;return std::max(0LL,std::chrono::duration_cast<std::chrono::milliseconds>(*n->entry.expires_at-std::chrono::steady_clock::now()).count());}
+bool StorageEngine::zadd(const std::string&k,double s,const std::string&m){std::lock_guard<std::mutex>g(mu_);auto*n=find_unlocked(k);if(!n){Node x;x.entry.value=SortedSetValue{};x.entry.bytes=k.size();lru_.push_front(k);x.lru_it=lru_.begin();table_.emplace(k,std::move(x));n=&table_.find(k)->second;}auto*z=std::get_if<SortedSetValue>(&n->entry.value);if(!z)return false;for(auto i=z->entries.begin();i!=z->entries.end();++i)if(i->first.second==m){z->entries.erase(i);break;}z->entries[{s,m}]=s;n->entry.bytes=k.size()+value_bytes(n->entry.value);memory_used_=0;for(auto&[a,b]:table_)memory_used_+=b.entry.bytes;evict_if_needed();return true;}
+bool StorageEngine::zrem(const std::string&k,const std::string&m){std::lock_guard<std::mutex>g(mu_);auto*n=find_unlocked(k);if(!n)return false;auto*z=std::get_if<SortedSetValue>(&n->entry.value);if(!z)return false;for(auto i=z->entries.begin();i!=z->entries.end();++i)if(i->first.second==m){z->entries.erase(i);n->entry.bytes=k.size()+value_bytes(n->entry.value);return true;}return false;}
+std::optional<double>StorageEngine::zscore(const std::string&k,const std::string&m){std::lock_guard<std::mutex>g(mu_);auto*n=find_unlocked(k);if(!n)return{};auto*z=std::get_if<SortedSetValue>(&n->entry.value);if(!z)return{};for(auto&[p,s]:z->entries)if(p.second==m)return s;return{};}
+std::vector<std::pair<std::string,double>>StorageEngine::zquery(const std::string&k,double lo,double hi,std::size_t lim){std::lock_guard<std::mutex>g(mu_);std::vector<std::pair<std::string,double>>r;auto*n=find_unlocked(k);if(!n)return r;auto*z=std::get_if<SortedSetValue>(&n->entry.value);if(!z)return r;for(auto&[p,s]:z->entries)if(p.first>=lo&&p.first<=hi){r.push_back({p.second,s});if(r.size()>=lim)break;}return r;}
+std::size_t StorageEngine::size()const{std::lock_guard<std::mutex>g(mu_);return table_.size();}
+std::size_t StorageEngine::memory_used()const{std::lock_guard<std::mutex>g(mu_);return memory_used_;}
+std::size_t StorageEngine::max_memory()const{return max_memory_;}
+void StorageEngine::clear(){std::lock_guard<std::mutex>g(mu_);table_.clear();lru_.clear();memory_used_=0;}
+bool StorageEngine::apply_set(const std::string&k,const std::string&v,long long t){return set(k,v,t<0?std::nullopt:std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(t)));}
+bool StorageEngine::apply_del(const std::string&k){return del(k);}bool StorageEngine::apply_zadd(const std::string&k,double s,const std::string&m){return zadd(k,s,m);}bool StorageEngine::apply_zrem(const std::string&k,const std::string&m){return zrem(k,m);}
+}
