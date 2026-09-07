@@ -1,9 +1,9 @@
 #include "storage/persistence.hpp"
-#include <filesystem>
+#include <sys/stat.h>
 #include <utility>
 namespace storage {
 Persistence::Persistence(std::string d):dir_(std::move(d)),wal_(dir_+"/wal.log"),snap_(dir_+"/snapshot.txt"){}
-bool Persistence::open(){std::filesystem::create_directories(dir_);out_.open(wal_,std::ios::app);return out_.good();}
+bool Persistence::open(){mkdir(dir_.c_str(),0755);out_.open(wal_,std::ios::app);return out_.good();}
 static void put(std::ofstream&o,const std::string&s){o<<s.size()<<':'<<s;}
 void Persistence::append_set(const std::string&k,const std::string&v,long long t){out_<<"S ";put(out_,k);out_<<' ';put(out_,v);out_<<' '<<t<<'\n';out_.flush();}
 void Persistence::append_del(const std::string&k){out_<<"D ";put(out_,k);out_<<'\n';out_.flush();}
